@@ -1,13 +1,24 @@
 import traceback,json
 from pathlib import Path
-from src.config.database import Session
+from src.config.database import Session,ReviewSession
 from src.models.entities import Report
 from src.services.reports import queue
 from src.services.normalization import analyze
+from src.services import sync
+
+def tick_review():
+    """Opportunistically advance the review copy; blocked/gap states are left untouched."""
+    try:
+        with Session() as src, ReviewSession() as review:
+            if not sync.has_pending(src,review):return
+        with Session() as src:sync.pull(src,100)
+    except Exception:traceback.print_exc()
+
 while True:
     Path('/tmp/worker-heartbeat').touch()
     item=queue.blpop('schemaworkbook:queue',timeout=2)
-    if not item:continue
+    if not item:
+        tick_review();continue
     ident=int(item[1])
     try:
         with Session() as db:

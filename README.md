@@ -16,7 +16,9 @@ docker compose up -d --build
 docker compose exec -T backend python -m scripts.seed_demo
 ```
 
-前端 http://localhost:18243 ，后端 http://localhost:19243/docs ，MySQL localhost:17743。
+前端 http://localhost:18243 ，后端 http://localhost:19243/docs ，MySQL localhost:17743（源库 `schemaworkbook`，复核库 `schemaworkbook_review`）。
+
+> 复核库使用独立数据库，由 `backend/migrations/002_review_database.sql` 在 **全新数据卷**首次启动时创建。若复用已有 MySQL 数据卷，需先手工执行一次：`docker compose exec db mysql -uroot -p"$DB_PASSWORD" < /docker-entrypoint-initdb.d/002_review_database.sql`；或把 `REVIEW_DATABASE_URL` 指回源库（同库不同表，仍可工作）。
 
 |角色|账号|密码|权限|
 |---|---|---|---|
@@ -29,6 +31,21 @@ docker compose exec -T backend python -m scripts.seed_demo
 09:00 operator登录；09:05打开 `NL-1117-A` 材料检测委托单；09:10查看五属性 `委托号,客户,检测项,方法,结果`；09:15确认 `委托号→客户`、`检测项→方法`、`委托号,检测项→结果`；09:20执行 `shift-20261117` 分解任务；09:25候选键为 `{委托号,检测项}`，拆出委托客户、检测项方法、委托检测结果3个关系；09:30导出 `report-1.json`；09:40 viewer复核3NF/依赖保持/无损均通过；10:00 admin审计。
 
 另有 `NL-1117-B` 的循环依赖 A→B/B→A与独立属性C，候选键AC/BC；`NL-1117-C` 没有确认依赖，完整属性集作为唯一候选键，不凭空猜测业务规则。
+
+## 复核库增量同步
+
+复核库是源库（关系草案 + 函数依赖）的只读副本，独立数据库保存（`REVIEW_DATABASE_URL`，默认 `schemaworkbook_review`）。页面第 V 页「复核库同步」展示同步状态、复核库**实际收下**的草案/依赖以及已应用提交。
+
+- **初次复制**：在一个源库快照里同时读提交序号与全部草案/依赖，基线之后的新提交交给增量重放；复制期间原库照常编辑。
+- **增量接上**：每次业务写入在**同一事务**内追加提交记录（提交序号 + 变更清单），回滚的事务随业务数据一起回滚，不传；提交序号在行锁下分配，已提交记录连续无洞。
+- **原子可见**：一笔提交的全部改动与游标、已应用提交在同一事务落库，要么全部可见，要么都不可见；同一提交里改了两张草案，不会只看到一张。
+- **归属迁移**：依赖改到另一份草案时按新归属 upsert，复核库只保留一条归属，旧归属随更新消失。
+- **断点续传与幂等**：只从 `cursor_seq+1` 接着传；重复投递按 `commit_id`/`seq` 跳过，不重复应用。
+- **断档暂停**：发现缺号（`gap`）或变更数不足（`incomplete`）立即暂停，游标不前进，保留最后可核对的版本；补齐后再次「接上增量」即可继续。应用异常同样暂停并记录错误。
+- **页面状态**：`empty 未复制 / copying 初次复制中 / syncing 同步中 / ready 可核对 / blocked 已暂停`，并与已应用提交列表、收下的副本一起展示。
+
+接口：`GET /sync/status`、`POST /sync/bootstrap`、`POST /sync/pull {limit}`、`POST /sync/reset`（admin 演示用）；只读副本 `GET /review/overview|relations|dependencies|commits`。operator/admin 可触发同步，viewer 只读；worker 空闲时也会按游标机会性接增量，断档状态不会被自动绕过。
+
 
 ## 算法说明
 
@@ -48,17 +65,17 @@ Python真算，MySQL保存草案/依赖与结果，Redis传递任务，独立wor
 
 |服务|技术|职责|
 |---|---|---|
-|frontend|原生HTML/CSS/JS + Nginx|4业务页、登录、共享业务表格与报告组件|
+|frontend|原生HTML/CSS/JS + Nginx|4业务页 + 复核库同步页、登录、共享业务表格与报告组件|
 |backend|Python3.11/FastAPI/SQLAlchemy/PyJWT|校验、权限、审计、快照与导出|
 |worker|Python3.11|闭包、候选键、3NF与chase|
-|db|MySQL8.0|JSON属性与依赖、任务报告|
+|db|MySQL8.0|源库：JSON属性与依赖、任务报告、提交日志；复核库：独立数据库保存副本与已应用提交|
 |redis|Redis7|持久任务队列|
 
-目录：`frontend/src/{api,stores,types,components/common,hooks,pages,router,utils,constants}`；`backend/src/{routes,controllers,services,models,schemas,middlewares,utils,constants,config}`；`backend/scripts/seed_demo.py`；`backend/migrations/001_initial.sql`。每核心实体贯穿模型/schema/service/route/API/store/page。组件table/badge/frame复用，hooks/session/feedback和utils/forms/html共用；request_id/errors双后端中间件。
+目录：`frontend/src/{api,stores,types,components/common,hooks,pages,router,utils,constants}`；`backend/src/{routes,controllers,services,models,schemas,middlewares,utils,constants,config}`；`backend/scripts/seed_demo.py`；`backend/migrations/001_initial.sql`、`002_review_database.sql`。复核库贯穿 `services/sync.py` → `routes/sync.py` → `api/sync.js`/`stores/sync.js` → `pages/sync.js`。每核心实体贯穿模型/schema/service/route/API/store/page。组件table/badge/frame复用，hooks/session/feedback和utils/forms/html共用；request_id/errors双后端中间件。
 
 枚举：角色admin/operator/viewer、任务queued/running/completed/failed；前后端定义位于 `backend/src/constants/enums.py` 和 `frontend/src/constants/enums.js`，security/reports、frame/badge消费；worker持久化状态。
 
-环境变量见.env.example：COMPOSE_PROJECT_NAME、FRONTEND_PORT/BACKEND_PORT/DB_PORT、DB_PASSWORD、JWT_SECRET、SEED_DEMO。默认密码仅本地演示，JWT8小时。seed按自然键只补缺失关系及初始依赖，不覆盖用户修改。schema由SQLAlchemy metadata.create_all初始化，无在线迁移引擎。
+环境变量见.env.example：COMPOSE_PROJECT_NAME、FRONTEND_PORT/BACKEND_PORT/DB_PORT、DB_PASSWORD、REVIEW_DATABASE_URL、JWT_SECRET、SEED_DEMO。默认密码仅本地演示，JWT8小时。seed按自然键只补缺失关系及初始依赖，不覆盖用户修改。schema由SQLAlchemy metadata.create_all初始化，无在线迁移引擎。
 
 本地开发：Python3.11安装backend/requirements.txt，配置DATABASE_URL/REDIS_URL后从backend运行 `uvicorn src.main:app --reload`、`python -m src.worker`；前端用Nginx同源代理/api。5服务均有健康检查和健康依赖，数据库/Redis/worker产物为独立命名卷。停止清空：`docker compose down -v --remove-orphans`。
 

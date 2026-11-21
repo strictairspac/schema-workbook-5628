@@ -1,3 +1,8 @@
 -- Initial schema is applied idempotently by SQLAlchemy metadata.create_all.
--- Authoritative models: src/models/entities.py (relations, dependencies, reports,
--- audit_logs and users). Dependencies/report snapshots are persisted as MySQL JSON.
+-- Authoritative models: src/models/entities.py. Two metadata groups:
+--   Base (source workbook): users, relations, dependencies, reports, audit_logs,
+--     sync_clock, sync_commits, sync_changes. Commit log rows are written in the same
+--     transaction as the business change, so rolled-back writes are never captured.
+--   ReviewBase (review copy, separate database by default): review_state,
+--     review_relations, review_dependencies, review_applied_commits.
+-- Dependencies/report snapshots are persisted as MySQL JSON.
